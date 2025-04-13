@@ -1,6 +1,6 @@
 package org.example.scheduler.processor;
 
-
+import org.apache.kafka.common.errors.SerializationException;
 import org.apache.kafka.streams.KeyValue;
 import org.apache.kafka.streams.kstream.Transformer;
 import org.apache.kafka.streams.processor.ProcessorContext;
@@ -17,124 +17,132 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.UUID;
 
-// Note: This class is no longer static and inner, assumes it's in its own file
-// Transformer<InputKey, InputValue, OutputKeyValue>
-public class SchedulingTransformer implements Transformer<String, ScheduleRequestDto, KeyValue<String, String>> {
+/**
+ * Kafka Streams Transformer responsible for scheduling messages.
+ * Uses structured objects (ScheduledJobValue) in the state store.
+ */
+public class SchedulingTransformer implements Transformer<String, ScheduleRequestDto, KeyValue<String, String>> { // Output type signature doesn't matter much here
 
     private static final Logger logger = LoggerFactory.getLogger(SchedulingTransformer.class);
 
     private final String stateStoreName;
-    private final String outputTopic; // Pass output topic name
+    private final String outputTopic;
+    private final Duration punctuationInterval;
 
     private ProcessorContext context;
-    // State Store: Key=schedulingKey (String), Value=ScheduledJobValue (Object)
-    private KeyValueStore<String, ScheduledJobValue> stateStore;
+    private KeyValueStore<String, ScheduledJobValue> stateStore; // Store holds objects
 
-    public SchedulingTransformer(String stateStoreName, String outputTopic) {
+    public SchedulingTransformer(String stateStoreName, String outputTopic, Duration punctuationInterval) {
         this.stateStoreName = stateStoreName;
-        this.outputTopic = outputTopic; // Store output topic
+        this.outputTopic = outputTopic;
+        this.punctuationInterval = punctuationInterval;
     }
 
     @Override
-    @SuppressWarnings("unchecked") // Suppress warning for cast from getStateStore
+    @SuppressWarnings("unchecked")
     public void init(ProcessorContext context) {
         this.context = context;
-        // Get the state store, assuming it's configured with <String, ScheduledJobValue> SerDes
-        this.stateStore = context.getStateStore(stateStoreName);
-        if (this.stateStore == null) {
-            throw new IllegalStateException("State store [" + stateStoreName + "] not found.");
+        try {
+            // Get store, expecting <String, ScheduledJobValue> due to topology config
+            this.stateStore = (KeyValueStore<String, ScheduledJobValue>) context.getStateStore(stateStoreName);
+            if (this.stateStore == null) {
+                throw new IllegalStateException("State store [" + stateStoreName + "] not found.");
+            }
+            logger.info("Initializing SchedulingTransformer for task {} with state store {}", context.taskId(), stateStoreName);
+            context.schedule(this.punctuationInterval, PunctuationType.WALL_CLOCK_TIME, this::punctuate);
+            logger.info("Punctuator scheduled for task {} with interval {}", context.taskId(), this.punctuationInterval);
+        } catch (Exception e) {
+            logger.error("Error during SchedulingTransformer initialization for task {}:", context.taskId(), e);
+            throw new RuntimeException("Failed to initialize SchedulingTransformer", e);
         }
-        logger.info("Initializing SchedulingTransformer for task {} with state store {}", context.taskId(), stateStoreName);
-
-        // Schedule punctuator - use a sensible interval (e.g., 1 second)
-        context.schedule(Duration.ofSeconds(1), PunctuationType.WALL_CLOCK_TIME, this::punctuate);
     }
 
     @Override
     public KeyValue<String, String> transform(String key, ScheduleRequestDto value) {
-        // Input value is now automatically deserialized into ScheduleRequestDto
-        logger.debug("Received message - Key: {}, Value: {}", key, value);
+        logger.debug("Received DTO - Key: {}, Value: {}", key, value);
         if (value == null) {
-            logger.warn("Received null value for key {}, skipping.", key);
+            logger.warn("Received null value DTO for key {}, skipping.", key);
             return null;
         }
 
         try {
             long delaySeconds = value.delaySeconds();
-            String originalPayload = value.payload(); // Payload as passed in
+            String originalPayload = value.payload();
 
             if (!StringUtils.hasText(originalPayload)) {
-                logger.warn("Received empty or null payload for key {}, skipping.", key);
+                logger.warn("Received request with empty/null payload for key {}, skipping.", key);
                 return null;
             }
-
             if (delaySeconds < 0) {
                 logger.warn("Received negative delay ({}) for key {}, treating as 0.", delaySeconds, key);
                 delaySeconds = 0;
             }
 
             long scheduledTimeMillis = Instant.now().plus(Duration.ofSeconds(delaySeconds)).toEpochMilli();
-
-            // Use a UUID for the scheduling key to ensure uniqueness, store original key in value
-            String schedulingKey = UUID.randomUUID().toString();
+            String schedulingKey = UUID.randomUUID().toString(); // Unique key for THIS scheduled item
+            // Create the structured value, storing the original key
             ScheduledJobValue jobValue = new ScheduledJobValue(scheduledTimeMillis, key, originalPayload);
 
-            // Store the structured value object
+            // Store the object (requires ScheduledJobValueSerde)
             stateStore.put(schedulingKey, jobValue);
-            logger.info("Scheduled job - Scheduling Key: {}, Original Key: {}, Scheduled Time: {}, Delay: {} secs",
+            logger.info("Scheduled job - Scheduling Key: {}, Original Key: {}, Target Time: {}, Delay: {} secs",
                     schedulingKey, key, Instant.ofEpochMilli(scheduledTimeMillis), delaySeconds);
 
+        } catch (SerializationException e) { // More specific catch
+            logger.error("Serialization error processing input for key {}: {}", key, value, e);
         } catch (Exception e) {
-            // Catch specific exceptions if possible
-            logger.error("Unexpected error processing message for key {}: {}", key, value, e);
-            // Consider error handling strategy (skip, DLQ, etc.)
+            logger.error("Unexpected error scheduling message for key {}: {}", key, value, e);
         }
-
-        return null; // Don't forward immediately
+        return null; // No immediate output from transform itself
     }
 
     private void punctuate(long currentTimestamp) {
-        logger.trace("Punctuator running at timestamp {}", currentTimestamp);
+        logger.trace("Punctuator running at timestamp {} for task {}", currentTimestamp, context.taskId());
+        int forwardedCount = 0;
+        // Iterate over the store holding ScheduledJobValue objects
         try (KeyValueIterator<String, ScheduledJobValue> iterator = stateStore.all()) {
             while (iterator.hasNext()) {
                 KeyValue<String, ScheduledJobValue> entry = iterator.next();
                 String schedulingKey = entry.key;
-                ScheduledJobValue jobValue = entry.value;
+                ScheduledJobValue jobValue = entry.value; // Get the object directly
 
-                if (jobValue == null) {
-                    logger.warn("Found null job value in state store for key {}, skipping.", schedulingKey);
-                    continue; // Skip potentially corrupted entries
+                if (jobValue == null || jobValue.scheduledTimeMillis() <= 0 || jobValue.originalPayload() == null) {
+                    logger.warn("Found invalid/null job value in state store for key {}, skipping. Value: {}", schedulingKey, jobValue);
+                    continue;
                 }
 
                 try {
-                    long scheduledTimeMillis = jobValue.scheduledTimeMillis();
-
-                    if (currentTimestamp >= scheduledTimeMillis) {
+                    // Check if due using the value object's field
+                    if (currentTimestamp >= jobValue.scheduledTimeMillis()) {
                         String originalKey = jobValue.originalKey();
                         String originalPayload = jobValue.originalPayload();
 
-                        logger.info("Message due - Scheduling Key: {}, Original Key: {}. Forwarding to {}",
+                        logger.info("Message due - Scheduling Key: {}, Original Key: {}. Attempting forward to {}",
                                 schedulingKey, originalKey, outputTopic);
 
-                        // Forward the original payload using the original key
+                        // Forward the original key and payload (both Strings)
                         context.forward(originalKey, originalPayload);
+                        forwardedCount++;
+                        logger.debug("Forward successful for Scheduling Key: {}", schedulingKey);
 
-                        // Remove *after* successful forward attempt
+                        // Delete entry from state store
                         stateStore.delete(schedulingKey);
+                        logger.debug("Deleted scheduling key {} from state store.", schedulingKey);
                     }
                 } catch (Exception e) {
-                    logger.error("Error processing scheduled message for scheduling key {}: {}", schedulingKey, jobValue, e);
-                    // Decide if the entry should be deleted or retried later based on the error
+                    logger.error("Error during forward/delete for scheduling key {}: {}. JobValue: {}", schedulingKey, e.getMessage(), jobValue, e);
                 }
             }
         } catch (Exception e) {
-            logger.error("Error during punctuation scan of state store.", e);
+            logger.error("Error during punctuation scan of state store for task {}.", context.taskId(), e);
+        }
+        if (forwardedCount > 0) {
+            logger.info("Punctuator forwarded {} messages for task {}.", forwardedCount, context.taskId());
         }
     }
 
     @Override
     public void close() {
         logger.info("Closing SchedulingTransformer for task {}", context != null ? context.taskId() : "N/A");
-        // State store is managed by Kafka Streams
     }
 }

@@ -6,8 +6,11 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.kafka.annotation.EnableKafkaStreams;
 
+/**
+ * Main Spring Boot application class for the Kafka Streams Scheduler.
+ * Enables Kafka Streams and relies on component scanning to find topology and config beans.
+ */
 @SpringBootApplication
-// ComponentScan will find SchedulerTopology and JsonSerdeConfig
 @EnableKafkaStreams
 public class KafkaStreamsSchedulerApplication {
 
@@ -17,7 +20,5 @@ public class KafkaStreamsSchedulerApplication {
         logger.info("Starting Kafka Streams Scheduler Application...");
         SpringApplication.run(KafkaStreamsSchedulerApplication.class, args);
         logger.info("Kafka Streams Scheduler Application Finished Startup.");
-
     }
-    // All beans (Topology, Serdes) are defined in other @Configuration/@Component classes
 }
