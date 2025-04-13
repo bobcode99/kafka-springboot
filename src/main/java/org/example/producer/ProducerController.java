@@ -13,17 +13,21 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.UUID;
 
-@RestController
+@RestController // Marks this as a REST controller component
 public class ProducerController {
 
     private static final Logger logger = LoggerFactory.getLogger(ProducerController.class);
     private static final String TARGET_TOPIC = "topic-c"; // Topic the Scheduler consumes
 
+    // Spring injects these beans because they are available in the application context
     @Autowired
     private KafkaTemplate<String, String> kafkaTemplate;
 
     @Autowired
-    private ObjectMapper objectMapper; // Jackson ObjectMapper provided by Spring Boot
+    private ObjectMapper objectMapper;
+
+    // Define a simple DTO (Data Transfer Object) for the request body
+    // Can be kept here or moved to its own file (e.g., ScheduleRequest.java) if preferred
 
     @GetMapping("/ping")
     public String pong() {
@@ -33,18 +37,15 @@ public class ProducerController {
     }
 
     @PostMapping("/schedule")
+    // Spring Boot/Jackson automatically deserialize the JSON body into the ScheduleRequest record
     public String sendMessage(@RequestBody ScheduleRequest request) {
-        logger.info("get sendMessage request");
         try {
-            // Generate a unique key for the message (optional, but good practice)
             String key = UUID.randomUUID().toString();
 
-            // Construct the JSON message expected by the Scheduler service
-            // {"delayMinutes": 5, "payload": "{\"message\":\"data for service b\"}"}
             ObjectNode messageNode = objectMapper.createObjectNode();
-            messageNode.put("delayMinutes", request.delayMinutes);
-            // Put the payload AS A STRING (it might be JSON string itself, or plain text)
-            messageNode.put("payload", request.payload);
+            // Use accessor methods for records
+            messageNode.put("delaySeconds", request.delaySeconds());
+            messageNode.put("payload", request.payload());
 
             String messageValue = objectMapper.writeValueAsString(messageNode);
 
@@ -58,10 +59,5 @@ public class ProducerController {
             return "Error sending message: " + e.getMessage();
         }
     }
-
-    // Define a simple DTO (Data Transfer Object) for the request body
-    static class ScheduleRequest {
-        public int delayMinutes;
-        public String payload; // This will be the content for the 'payload' field
-    }
 }
+
