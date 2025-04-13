@@ -66,8 +66,7 @@ public class SchedulerTopology {
         inputStream.transform(
                 () -> new SchedulingTransformer(STATE_STORE_NAME, OUTPUT_TOPIC, PUNCTUATION_INTERVAL),
                 STATE_STORE_NAME // Associate with the state store
-        );
-        // NO .to(OUTPUT_TOPIC) here - it's handled by context.forward in the transformer
+        ).to(OUTPUT_TOPIC);
 
         logger.info("SchedulingTransformer configured. Output via context.forward() to topic '{}'.", OUTPUT_TOPIC);
         logger.info("Kafka Streams topology built successfully.");
